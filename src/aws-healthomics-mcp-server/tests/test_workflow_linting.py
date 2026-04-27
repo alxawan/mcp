@@ -23,6 +23,7 @@ from awslabs.aws_healthomics_mcp_server.tools.workflow_linting import (
     lint_workflow_bundle,
     lint_workflow_definition,
 )
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
@@ -1846,3 +1847,148 @@ steps:
 
         assert result['status'] == 'error'
         assert 'Unsupported workflow format: nextflow' in result['message']
+
+
+class TestPathTraversalPrevention:
+    """Security tests for CWE-22 path traversal prevention in bundle linting."""
+
+    def setup_method(self):
+        """Set up test fixtures."""
+        self.wdl_linter = WDLWorkflowLinter()
+        self.cwl_linter = CWLWorkflowLinter()
+
+    # --- _validate_bundle_path helper tests ---
+
+    def test_validate_bundle_path_safe_path(self):
+        """Test that safe relative paths pass validation."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            assert self.wdl_linter._validate_bundle_path('main.wdl', tmp_path) is None
+            assert self.wdl_linter._validate_bundle_path('sub/dir/file.wdl', tmp_path) is None
+
+    def test_validate_bundle_path_traversal_detected(self):
+        """Test that ../ traversal paths are rejected."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            result = self.wdl_linter._validate_bundle_path('../../etc/passwd', tmp_path)
+            assert result is not None
+            assert 'Path traversal detected' in result
+
+    def test_validate_bundle_path_absolute_path(self):
+        """Test that absolute paths are rejected."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            result = self.wdl_linter._validate_bundle_path('/etc/passwd', tmp_path)
+            assert result is not None
+            assert 'Path traversal detected' in result
+
+    # --- WDL linter path traversal tests ---
+
+    @pytest.mark.asyncio
+    async def test_wdl_bundle_rejects_traversal_in_file_keys(self):
+        """Test WDL linter rejects ../ in workflow_files keys."""
+        result = await self.wdl_linter.lint_workflow_bundle(
+            workflow_files={
+                '../../tmp/escaped.txt': 'malicious content',
+                'main.wdl': 'version 1.0\nworkflow Test {}',
+            },
+            main_workflow_file='main.wdl',
+        )
+        assert result['status'] == 'error'
+        assert 'Path traversal detected' in result['message']
+
+    @pytest.mark.asyncio
+    async def test_wdl_bundle_rejects_traversal_in_main_file(self):
+        """Test WDL linter rejects ../ in main_workflow_file."""
+        result = await self.wdl_linter.lint_workflow_bundle(
+            workflow_files={'main.wdl': 'version 1.0\nworkflow Test {}'},
+            main_workflow_file='../../etc/main.wdl',
+        )
+        assert result['status'] == 'error'
+        assert 'Path traversal detected' in result['message']
+
+    @pytest.mark.asyncio
+    async def test_wdl_bundle_rejects_absolute_path_in_file_keys(self):
+        """Test WDL linter rejects absolute paths in workflow_files keys."""
+        result = await self.wdl_linter.lint_workflow_bundle(
+            workflow_files={
+                '/tmp/malicious.wdl': 'version 1.0\nworkflow Evil {}',
+                'main.wdl': 'version 1.0\nworkflow Test {}',
+            },
+            main_workflow_file='main.wdl',
+        )
+        assert result['status'] == 'error'
+        assert 'Path traversal detected' in result['message']
+
+    # --- CWL linter path traversal tests ---
+
+    @pytest.mark.asyncio
+    async def test_cwl_bundle_rejects_traversal_in_file_keys(self):
+        """Test CWL linter rejects ../ in workflow_files keys."""
+        result = await self.cwl_linter.lint_workflow_bundle(
+            workflow_files={
+                '../../tmp/escaped.txt': 'malicious content',
+                'main.cwl': 'cwlVersion: v1.0\nclass: Workflow',
+            },
+            main_workflow_file='main.cwl',
+        )
+        assert result['status'] == 'error'
+        assert 'Path traversal detected' in result['message']
+
+    @pytest.mark.asyncio
+    async def test_cwl_bundle_rejects_traversal_in_main_file(self):
+        """Test CWL linter rejects ../ in main_workflow_file."""
+        result = await self.cwl_linter.lint_workflow_bundle(
+            workflow_files={'main.cwl': 'cwlVersion: v1.0\nclass: Workflow'},
+            main_workflow_file='../../etc/main.cwl',
+        )
+        assert result['status'] == 'error'
+        assert 'Path traversal detected' in result['message']
+
+    @pytest.mark.asyncio
+    async def test_cwl_bundle_rejects_absolute_path_in_file_keys(self):
+        """Test CWL linter rejects absolute paths in workflow_files keys."""
+        result = await self.cwl_linter.lint_workflow_bundle(
+            workflow_files={
+                '/tmp/malicious.cwl': 'cwlVersion: v1.0\nclass: CommandLineTool',
+                'main.cwl': 'cwlVersion: v1.0\nclass: Workflow',
+            },
+            main_workflow_file='main.cwl',
+        )
+        assert result['status'] == 'error'
+        assert 'Path traversal detected' in result['message']
+
+    # --- Verify no file escape ---
+
+    @pytest.mark.asyncio
+    async def test_traversal_does_not_write_files(self):
+        """Verify that path traversal attempts do not write any files outside temp dir."""
+        import os
+        import tempfile
+
+        # Create a canary file path that the attack would target
+        canary_dir = tempfile.mkdtemp()
+        canary_path = os.path.join(canary_dir, 'escaped.txt')
+
+        try:
+            # Attempt traversal attack targeting the canary location
+            result = await self.wdl_linter.lint_workflow_bundle(
+                workflow_files={
+                    f'../../../../../..{canary_path}': 'ATTACK PAYLOAD',
+                    'main.wdl': 'version 1.0\nworkflow Test {}',
+                },
+                main_workflow_file='main.wdl',
+            )
+            assert result['status'] == 'error'
+            # Verify the canary file was NOT created
+            assert not os.path.exists(canary_path), 'Path traversal wrote a file outside temp dir!'
+        finally:
+            import shutil
+
+            shutil.rmtree(canary_dir, ignore_errors=True)

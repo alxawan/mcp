@@ -14,6 +14,7 @@
 
 """Workflow linting tools for WDL and CWL workflow definitions."""
 
+import os
 import tempfile
 from abc import ABC, abstractmethod
 from awslabs.aws_healthomics_mcp_server.utils.content_resolver import (
@@ -115,6 +116,32 @@ class WorkflowLinter(ABC):
         response.update(kwargs)
         return response
 
+    def _validate_bundle_path(self, file_path: str, tmp_path: Path) -> Optional[str]:
+        """Validate that a file path stays within the temporary directory.
+
+        Prevents path traversal attacks (CWE-22) by resolving the path and
+        checking it remains under the temp directory root.
+
+        Args:
+            file_path: The user-supplied relative file path to validate
+            tmp_path: The temporary directory root
+
+        Returns:
+            An error message string if validation fails, None if the path is safe
+        """
+        try:
+            full_path = (tmp_path / file_path).resolve()
+        except Exception:
+            return f'Invalid file path in workflow bundle: {file_path}'
+
+        tmp_resolved = tmp_path.resolve()
+        if not str(full_path).startswith(str(tmp_resolved) + os.sep) and full_path != tmp_resolved:
+            return (
+                f'Path traversal detected in workflow file path: {file_path!r}. '
+                f'File paths must remain within the workflow bundle directory.'
+            )
+        return None
+
 
 class WDLWorkflowLinter(WorkflowLinter):
     """Linter for WDL workflow definitions using miniwdl."""
@@ -179,13 +206,20 @@ class WDLWorkflowLinter(WorkflowLinter):
             with tempfile.TemporaryDirectory() as tmp_dir:
                 tmp_path = Path(tmp_dir)
 
-                # Write all files to temporary directory maintaining structure
+                # Validate and write all files to temporary directory maintaining structure
                 for file_path, content in workflow_files.items():
-                    full_path = tmp_path / file_path
+                    error = self._validate_bundle_path(file_path, tmp_path)
+                    if error:
+                        return self._create_error_response(error)
+                    full_path = (tmp_path / file_path).resolve()
                     full_path.parent.mkdir(parents=True, exist_ok=True)
                     full_path.write_text(content)
 
-                main_file_path = tmp_path / main_workflow_file
+                # Validate main_workflow_file path
+                error = self._validate_bundle_path(main_workflow_file, tmp_path)
+                if error:
+                    return self._create_error_response(error)
+                main_file_path = (tmp_path / main_workflow_file).resolve()
 
                 if not main_file_path.exists():
                     return self._create_error_response(
@@ -279,13 +313,20 @@ class CWLWorkflowLinter(WorkflowLinter):
             with tempfile.TemporaryDirectory() as tmp_dir:
                 tmp_path = Path(tmp_dir)
 
-                # Write all files to temporary directory maintaining structure
+                # Validate and write all files to temporary directory maintaining structure
                 for file_path, content in workflow_files.items():
-                    full_path = tmp_path / file_path
+                    error = self._validate_bundle_path(file_path, tmp_path)
+                    if error:
+                        return self._create_error_response(error)
+                    full_path = (tmp_path / file_path).resolve()
                     full_path.parent.mkdir(parents=True, exist_ok=True)
                     full_path.write_text(content)
 
-                main_file_path = tmp_path / main_workflow_file
+                # Validate main_workflow_file path
+                error = self._validate_bundle_path(main_workflow_file, tmp_path)
+                if error:
+                    return self._create_error_response(error)
+                main_file_path = (tmp_path / main_workflow_file).resolve()
 
                 if not main_file_path.exists():
                     return self._create_error_response(
